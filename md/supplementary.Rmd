@@ -1155,14 +1155,7 @@ kable(ppK.dtb,
                   full_width = FALSE)
 ```
 
-## 2.3---Differential Expression Analysis ##
-Differential expression analysis aims to seize molecular signatures underlying
-the biology of a particular phenotype.  We compared lists of differentially
-expressed genes between grade 2 (moderately differentiated) and grade 3 (poorly
-differentiated) samples prior- and post-dataset integration, from datasets
-GSE25065, GSE2034 and GSE17705 (**Table 4**). Samples were FRMA normalised.
-
-```{r dea, eval = TRUE, cache = TRUE}
+```{r dea, eval = FALSE, cache = TRUE}
 getDiffExprGns <- function(gse,                # dataset to extract phenotype from
                            nGenes = 1e2,       # number of top genes to retrieve from analysis
                            marker = "grade") { # %in% c("grade", "grade")
@@ -1278,16 +1271,7 @@ tab5.dtb <- tab5.dtb[nGenesTab5.dtb]
 
 ```
 
-This is not going to work.  Because BC transforms each dataset internally in a
-scaled fashion, it does much better at preserving the internal differences
-between phenotypic classes.  Out method, on the other hand, alters patterns of
-gene expression on a per-subtype basis within each dataset.  This means that,
-unless the phenotype we are investigating is aligned with the subtyping method
-we used to integrate the data, differential expression analysis between classes
-is going to do worse with SABC than with BC, only because our correction method
-will be perceived to add noise to the phenotypic classes we are testing.
-
-```{r table-4, results = "as.is", eval = TRUE, cache = FALSE}
+```{r table-4, results = "as.is", eval = FALSE, cache = FALSE}
 setnames(tab4.dtb,
          c("nbGenesDE_BC",
            "nbGenesDE_SABC3",
@@ -1316,20 +1300,7 @@ kable(tab5.dtb,
                   full_width = FALSE)
 ```
 
-## 2.4---Dataset Integrity Assessment ##
-
-Because of the intrinsic nature
-of
-[co-expression links](http://genome.cshlp.org/content/14/6/1085.long "Coexpression Analysis of Human Genes Across Many Microarray Data Sets") in
-biological systems, global patterns of gene expression can be used as surrogates
-of signal integrity, based
-on
-[signal-to-noise metrics](http://journals.plos.org/plosone/article?id=10.1371/journal.pone.0051013 "A Measure of the Signal-to-Noise Ratio of Microarray Samples and Studies Using Gene Correlations").
-We have used a signal-to-noise ratio quality metric to assess the integrity of
-biological signals in integrated datasets, using BC, SABC3 and SABC5 to correct
-for batch effect.
-
-```{r snagee, eval = TRUE, cache = TRUE}
+```{r snagee, eval = FALSE, cache = TRUE}
 snageeWrapper <- function(obj, # object must be either eSet or matrix
                           chip) {
     ## retrieve list with two components:
@@ -1409,7 +1380,7 @@ qual.dtb[, nrmMth := ordered(nrmMth,
 
 ```
 
-```{r snagee-plot, eval = TRUE, height = 2, width = 8}
+```{r snagee-plot, eval = FALSE, height = 2, width = 8}
 ggplot(qual.dtb,
        aes(x = itgMth,
            y = qualStudy)) +
