@@ -34,26 +34,8 @@ doSubtypeCombat <- function(mtx, # concatenated expression matrix of at least
     sn2 <- sampleInfo.dtb[tableSubtypeCrossBatch.dtb[N > 1]][, sn]
     ## intersect both sets of samples
     validSn <- intersect(sn1, sn2)
-    ## lst <- tapply(1:ncol(mtx),
-    ##               subtypePreds.fac, function(x) {
-    ##                   list(d = mtx[, x],
-    ##                        b = d.fac[x])
-    ##               })
-    ## nSamples.lst <- lapply(lst, function(l) table(l$b))
-    ## samples2rm.lst <- lapply(nSamples.lst, function(sbt) {
-    ##     res <- sbt < nMin
-    ##     if(sum(!res) < 2) {
-    ##         return(setNames(rep(TRUE, length(sbt)),
-    ##                         names(sbt)))
-    ##     } else {
-    ##         return(res)
-    ##     }
-    ## })
     ## define index of samples that meet required conditions
     idx2kp <- colnames(mtx) %in% validSn
-    ## idx2kp <- mapply(function(st, b) !samples2rm.lst[[st]][[b]],
-    ##                  st = sampleInfo.dtb[["st"]],
-    ##                  b = sampleInfo.dtb[["b"]])
     ## redefine list of subtype-specific batches only with samples that meet
     ## required conditions
     rdx.lst <- tapply(1:ncol(mtx[, idx2kp]),
