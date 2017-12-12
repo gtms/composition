@@ -51,12 +51,11 @@ doSubtypeCombat <- function(mtx, # concatenated expression matrix of at least
                batch = sbt$b)
     }))
     ## return integrated matrix, with removed samples as NA
-    out.mtx <- matrix(rep(NA, nrow(mtx) * ncol(mtx)),
+    out.mtx <- matrix(NA,
                       ncol = ncol(mtx),
+                      nrow = nrow(mtx),
                       dimnames = list(rownames(mtx),
                                       colnames(mtx)))
-    for(clnm in colnames(cbt.mtx)) {
-        out.mtx[, clnm] <- cbt.mtx[, clnm]
-    }
+    out.mtx[, colnames(cbt.mtx)] <- cbt.mtx
     out.mtx
 }
