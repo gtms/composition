@@ -28,7 +28,9 @@ doSubtypeCombat <- function(mtx, # concatenated expression matrix of at least
     ## 2. Each subtype must encompass at least two batches, i.e., no given
     ## subtype can only integrate samples from one batch: remove all samples
     ## that contribute to violate this condition.
-    tableSubtypeCrossBatch.dtb <- tableSampleInfo.dtb[, .N, by = st]
+    ## tableSubtypeCrossBatch.dtb <- tableSampleInfo.dtb[, .N, by = st]
+    setkey(sampleInfo.dtb, sn)
+    tableSubtypeCrossBatch.dtb <- sampleInfo.dtb[sn1, .N, by = .(b, st)][, .N, by = st]
     setkey(tableSubtypeCrossBatch.dtb, st)
     setkey(sampleInfo.dtb, st)
     sn2 <- sampleInfo.dtb[tableSubtypeCrossBatch.dtb[N > 1]][, sn]
