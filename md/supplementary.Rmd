@@ -52,6 +52,7 @@ csvDir <- "../data/csv"
 dsetDir <- "../data/rds"
 libDir <- "../lib"
 graphsDir <- "../out/pdf"
+hrmnDataDir <- "../eddie/data/out"
 
 ## Affy Chips
 chips <- c("p2", "a")
@@ -303,10 +304,66 @@ itg.lst[["sabc5"]] <- lapply(chips, function(chip) {
     }), names(cc.lst[[chip]]))
 })
 names(itg.lst[["sabc5"]]) <- chips
+## 3. Harman
+## read data
+hrmnFls <- list.files(hrmnDataDir, pattern = "Rds")
+hrmn.lst <- lapply(hrmnFls, function(flNm) readRDS(file.path(hrmnDataDir, flNm)))
+names(hrmn.lst) <- gsub("harman-integrated-(.*).Rds", "\\1", hrmnFls)
+## reconstruct corrected data
+hrmnCtd.lst <- lapply(hrmn.lst, reconstructData)
+## 3.1 with 5-subtype SSP
+itg.lst[["hrmn5"]] <- setNames(lapply(chips, function(chip) {
+    setNames(sapply(normMths, function(normMth) {
+        hrmnCtd.lst[sprintf("%s-%s", chip, normMth)]
+    }), normMths)
+}), chips)
+## 4. BC with covariate
+## 4.1 sith 5-suptype SSP
+itg.lst[["bccov5"]] <- lapply(chips, function(chip) {
+    chip.lst <- cc.lst[[chip]]
+    setNames(lapply(names(chip.lst), function(nrmMth) {
+        mtx <- chip.lst[[nrmMth]]
+        ComBat(dat = mtx,
+               batch = fac.lst[[chip]],
+               mod = model.matrix(~ as.factor(preds.dtb[normMth == nrmMth][colnames(mtx), intrinsic.sorlie2003])))
+    }), names(chip.lst))
+})
+names(itg.lst[["bccov5"]]) <- chips
 ## write itg.lst on disk
 ## saveRDS(itg.lst,
 ##         file.path(rdsDir,
 ##                   "integrated-matrices.Rds"))
+```
+
+```{r compute-nb-na-samples, eval = TRUE, cache = TRUE}
+## compute number of NA samples in each integrated matrix
+computeNbNASmpls <- function(mtx) {
+        sum(apply(mtx,
+                  2,
+                  function(x) sum(!is.na(x)) == 0))
+}
+nbNASmpls <- rapply(itg.lst,
+                    computeNbNASmpls,
+                    classes = "matrix",
+                    how = "unlist")
+nbNASmpls.dtb <- as.data.table(do.call(rbind, strsplit(names(nbNASmpls), split = "\\.")))
+setnames(nbNASmpls.dtb, c("itgMth", "chip", "nrmMth"))
+nbNASmpls.dtb[, nbNASmpls := nbNASmpls]
+## for each matrix, retrieve samples names for which all observations are NA
+retrieveNonNASmpls <- function(mtx) {
+    !apply(mtx,
+           2,
+           function(x) sum(!is.na(x)) == 0)
+}
+system.time(whichNonNASmplsNstd.lst <- rapply(itg.lst,
+                                              retrieveNonNASmpls,
+                                              class = "matrix",
+                                              how = "list"))
+whichNonNASmpls.lst <- do.call(c, unlist(whichNonNASmplsNstd.lst, recursive = FALSE))
+mcdSmpls.lst <- lapply(chips, function(chip) {
+    Reduce("&", whichNonNASmpls.lst[grepl(sprintf("\\.%s\\.", chip), names(whichNonNASmpls.lst))])
+})
+names(mcdSmpls.lst) <- chips
 ```
 
 ## 2.1---Distortion of Molecular *ESR1* and *ERBB2* Measurements ##
@@ -330,7 +387,7 @@ erbb2Probe <- "216836_s_at" # Nicholas Moir
 ## .normalisation procedure (frma, rma or mas5)
 cbn.dfr <- expand.grid(chip = chips,
                        ihc.marker = c("er", "her2"),
-                       itg.method = c("nc", "bc", "sabc3", "sabc5"),
+                       itg.method = c("nc", "bc", "sabc3", "sabc5", "hrmn5", "bccov5"),
                        nrm.method = c("frma", "rma", "mas5"),
                        stringsAsFactors = FALSE)
 buildBxpltData <- function(chip,
@@ -391,6 +448,7 @@ preserved from extreme distortion by SABC integration (**Fig.3**).
 ggplot(bxplt.dtb[chip == "a" &
                  ihc.marker == "er" &
                  !is.na(ihc.status) &
+                 itg.method %in% c("nc", "bc", "sabc3", "sabc5") &
                  ## nrm.method == "frma" &
                  !is.na(expr)],
        aes(x = ordered(dataset,
@@ -495,6 +553,7 @@ ggplot(bxplt.dtb[dataset %in% c("GSE16446",
 ggplot(bxplt.dtb[dataset %in% c("GSE5327",
                                 "GSE17705") &
                  chip == "a" &
+                 itg.method %in% c("nc", "bc", "sabc3", "sabc5") &
                  ihc.marker == "er"],
        aes(x = ordered(dataset,
                        levels = c("GSE5327",
@@ -604,6 +663,7 @@ ggplot(bxplt.dtb[dataset %in% c("GSE5327",
 ggplot(bxplt.dtb[chip == "p2" &
                  ihc.marker == "er" &
                  !is.na(ihc.status) &
+                 itg.method %in% c("nc", "sabc5", "bccov5", "hrmn5") &
                  ## nrm.method == "frma" &
                  !is.na(expr)],
        aes(x = ordered(dataset,
@@ -724,6 +784,7 @@ integrated with SABC3 and SABC5 (**Fig.4**).
 ggplot(bxplt.dtb[dataset %in% c("GSE23177",
                                 "GSE17907") &
                  chip == "p2" &
+                 itg.method %in% c("nc", "bc", "sabc3", "sabc5") &
                  ihc.marker == "her2"],
        aes(x = ordered(dataset,
                        levels = c("GSE23177",
@@ -875,11 +936,18 @@ pam50Mlt.dtb[, pam50 := ordered(pam50,
                                            "Luminal B",
                                            "Normal"))]
 pam50Mlt.dtb[, itgMth := ordered(itgMth,
-                                 levels = c("nc", "bc", "sabc3", "sabc5"),
+                                 levels = c("nc",
+                                            "bc",
+                                            "sabc3",
+                                            "sabc5",
+                                            "bccov5",
+                                            "hrmn5"),
                                  labels = c("Prior to\nIntegration",
                                             "BC",
                                             "SABC3",
-                                            "SABC5"))]
+                                            "SABC5",
+                                            "BCCOV5",
+                                            "HRMN5"))]
 ```
 
 ```{r pam50-concordance-plot, fig.height = 5, fig.width = 9, fig.cap = 'Figure 5---PAM50 subtype assignments for 1015 samples from six datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  Subtype assignements were computed prior to dataset integration (first row) and post integration with BC, SABC3 and SABC5 (subsequent rows).'}
@@ -889,10 +957,11 @@ gseLbls[length(gseLbls)] <- sprintf("GSE\n%s", gsub("GSE", "", gseLvls[length(gs
 ## pam50Mlt.dtb[, gse := ordered(gse,
 ##                               levels = levels(gse),
 ##                               labels = gseLbls)]
-ggplot(pam50Mlt.dtb, aes(x = sampleName,
-                         y = 1,
-                         fill = pam50,
-                         colour = pam50)) +
+ggplot(pam50Mlt.dtb[!itgMth %in% c("BCCOV5", "HRMN5")],
+       aes(x = sampleName,
+           y = 1,
+           fill = pam50,
+           colour = pam50)) +
   geom_tile() +
   scale_fill_manual(values = cols) +
   scale_colour_manual(values = cols) +
@@ -1087,9 +1156,9 @@ ppPam50Mlt.dtb[, itgMth := ordered(itgMth,
 
 ```{r pam50-concordance-proportions-plot, fig.height = 5, fig.width = 9, fig.cap = 'Figure 6---PAM50 subtype assignments for 580 samples from five datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  For each dataset, 116 samples were randomly selected in order to respect the original IHC ER+ fraction.  Subtype assignments were computed prior- (top row) and post- (subsequent rows) dataset integration with BC, SABC3 and SABC5.'}
 ggplot(ppPam50Mlt.dtb, aes(x = sampleName,
-                         y = 1,
-                         fill = pam50,
-                         colour = pam50)) +
+                           y = 1,
+                           fill = pam50,
+                           colour = pam50)) +
   geom_tile() +
   scale_fill_manual(values = cols) +
   scale_colour_manual(values = cols) +
@@ -1112,14 +1181,15 @@ ggplot(ppPam50Mlt.dtb, aes(x = sampleName,
 
 ```{r p2-kvals-proportions, eval = TRUE, cache = TRUE}
 ppK.lst <- list()
-ppK.lst[["all"]] <- sapply(itgMths, function(itgMth) {
+itgMthsRdx <- c("bc", "nc", "sabc3", "sabc5")
+ppK.lst[["all"]] <- sapply(itgMthsRdx, function(itgMth) {
     getKval(ppPam50.dtb[, c("nc", itgMth), with = FALSE])
 })
 setkey(ppPam50.dtb, gse)
 gses <- ppPam50.dtb[, levels(gse)]
 ppK.lst <- c(ppK.lst,
              setNames(lapply(gses, function(gse) {
-                 sapply(itgMths, function(itgMth) {
+                 sapply(itgMthsRdx, function(itgMth) {
                      getKval(ppPam50.dtb[gse,
                                          c("nc", itgMth),
                                          with = FALSE])
@@ -1139,7 +1209,7 @@ ppK.dtb <- dsets.dtb[, c("GSE",
 setnames(ppK.dtb,
          c("GSE", "nSamples", "fracER+", "fracHER2+",
            sprintf("Cohen's Kappa: %s",
-                   toupper(itgMths))))
+                   toupper(itgMthsRdx))))
 ppK.dtb[GSE != "all", nSamples := 116]
 ppK.dtb[GSE == "all", nSamples := ppK.dtb[, sum(nSamples, na.rm = TRUE)]]
 setorder(ppK.dtb, -nSamples)
@@ -1396,4 +1466,172 @@ ggplot(qual.dtb,
           strip.text.x = element_text(size = 7),
           strip.text.y = element_text(size = 10))
 
+```
+
+## 2.3---Comparison with other Methods ##
+
+SABC is not the first method to account for external biological variables or
+clinical covariates during dataset integration. ComBat offers the possibility of
+using clinical variables as covariates during dataset integration.
+[Harman](https://www.ncbi.nlm.nih.gov/pubmed/27585881 "Risk-conscious correction
+of batch effects: maximising information extraction from high-throughput genomic
+datasets"), a more recent integration procedure using a PCA and a constrained
+optimisation technique, also calls for factor coding for an "experimental
+grouping variable" to drive integration.  We ran ComBat and Harman to integrate
+the 1015 breast tumours hybridised onto the the HG-U133Plus2 chip, using the the
+output of the 5-class sorlie2003 SSP as covariate and experimental grouping
+variable respectively.
+
+```{r er-a-boxplots-other, fig.height = 6, fig.width = 9, eval = TRUE, fig.cap = 'Figure X---205225_at probeset measurements hybridised onto the HG-U133a chip broken by dataset prior and post integration.  Integration was done using subtype-aware batch correction (SABC5, driven by a five-subtype SSP), ComBat (BCCOV5, using a five-subtype SSP as covariate) and Harman (HRMN5, using a five-subtype SSP as a grouping variable).  The distributions are further split by ER status, independently assessed by IHC on fresh frozen specimens.  Raw data was normalised with FRMA, RMA and MAS5.'}
+ggplot(bxplt.dtb[chip == "a" &
+                 ihc.marker == "er" &
+                 !is.na(ihc.status) &
+                 itg.method %in% c("nc", "sabc5", "bccov5", "hrmn5") &
+                 ## nrm.method == "frma" &
+                 !is.na(expr)],
+       aes(x = ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE25065",
+                                  "GSE2034",
+                                  "GSE17705")),
+           y = expr,
+           colour = ordered(ihc.status,
+                            levels = 0:1,
+                            labels = c("ER-", "ER+")))) +
+    geom_boxplot() +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    scale_y_continuous(limits = c(2.5, 14)) +
+    scale_colour_manual(name = "IHC ER Status",
+                        values = c("violetred", "steelblue")) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "sabc5",
+                                      "bccov5",
+                                      "hrmn5"),
+                           labels = c("Prior to Integration",
+                                      "SABC5",
+                                      "BCCOV5",
+                                      "HRMN5")),
+               scales = "free") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 14),
+          legend.position = "top",
+          legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16))
+```
+
+```{r er-a-extreme-datasets-by-er-status-other, fig.height = 5, fig.width = 8, eval = TRUE, fig.cap = 'Figure Y---Distributions of probeset 205225_at measurements from datasets GSE5327 (n=58, all ER--) and GSE17705 (n=298, all ER+), taken from **Fig.X**, are compared side by side. See **Fig.X** for details.'}
+ggplot(bxplt.dtb[dataset %in% c("GSE5327",
+                                "GSE17705") &
+                 chip == "a" &
+                 itg.method %in% c("nc", "sabc5", "bccov5", "hrmn5") &
+                 ihc.marker == "er"],
+       aes(x = ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE17705"),
+                       labels = c("GSE5327\n0% ER+",
+                                  "GSE17705\n100% ER+")),
+           y = expr)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(5, 18)) +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    geom_signif(comparisons = list(c("GSE5327\n0% ER+",
+                                     "GSE17705\n100% ER+")),
+                y_position = 16,
+                vjust = -.4,
+                test = "t.test",
+                textsize = 3.6,
+                tip_length = 0) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "sabc5",
+                                      "bccov5",
+                                      "hrmn5"),
+                           labels = c("Prior to Integration",
+                                      "SABC5",
+                                      "BCCOV5",
+                                      "HRMN5")),
+               scales = "free") +
+    ## ggtitle("HG-U133a") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 12),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 12),
+          plot.title = element_text(size = 16))
+## ggsave(file.path(graphsDir, "comparisons-extreme-datasets-a.pdf"),
+##        width = 11,
+##        height = 5)
+```
+
+```{r gPCA, eval = FALSE}
+system.time(gpcaCor.lst <- lapply(c("sabc5", "bccov5", "hrmn5"), function(m) {
+    mtx <- itg.lst[[m]][["a"]][["frma"]][, mcdSmpls.lst[["a"]]]
+    b <- as.numeric(fac.lst[["a"]][mcdSmpls.lst[["a"]]])
+    gPCA.batchdetect(x = t(mtx),
+                     batch = b,
+                     center = FALSE,
+                     nperm = 1e3)
+}))
+gpcaUncor <- gPCA.batchdetect(x = t(cc.lst[["a"]][["frma"]]),
+                       batch = as.numeric(fac.lst[["a"]]),
+                       center = FALSE,
+                       nperm = 1e3)
+
+```
+
+```{r pam50-concordance-plot-other, fig.height = 5, fig.width = 9, fig.cap = 'Figure Z---PAM50 subtype assignments for 1015 samples from six datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  Subtype assignements were computed prior to dataset integration (first row) and post integration with BC, SABC3 and SABC5 (subsequent rows).'}
+## gseLvls <- pam50Mlt.dtb[, levels(gse)]
+## gseLbls <- gseLvls
+## gseLbls[length(gseLbls)] <- sprintf("GSE\n%s", gsub("GSE", "", gseLvls[length(gseLbls)]))
+## pam50Mlt.dtb[, gse := ordered(gse,
+##                               levels = levels(gse),
+##                               labels = gseLbls)]
+ggplot(pam50Mlt.dtb[!itgMth %in% c("BC", "SABC3")],
+       aes(x = sampleName,
+           y = 1,
+           fill = pam50,
+           colour = pam50)) +
+  geom_tile() +
+  scale_fill_manual(values = cols) +
+  scale_colour_manual(values = cols) +
+    facet_grid(itgMth ~ ordered(gse,
+                                levels = levels(gse),
+                                labels = gseLbls),
+               scale = "free",
+               space = "free") +
+  theme_bw() +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
 ```
