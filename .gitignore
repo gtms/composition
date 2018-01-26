@@ -5,7 +5,7 @@
 .tramp_history
 *.pdf
 *.html
-*.md
+# *.md
 
 ## directories
 cache/
