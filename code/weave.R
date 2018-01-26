@@ -1,5 +1,6 @@
 library(rmarkdown)
 
-render("../md/supplementary.Rmd",
-       output_dir = "../out/html",
+render("../md/readme.Rmd",
+       ## output_dir = "../out/html",
+       output_dir = "..",
        intermediates_dir = "../tmp")

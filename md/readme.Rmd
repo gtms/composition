@@ -1,0 +1,1632 @@
+---
+title: |
+    | Subtype-aware batch correction retains biological signal of integrated
+    | breast cancer datasets---Supplementary Methods
+author: |
+    | Gil Tomás
+    | gil.tomas@igmm.ed.ac.uk
+output:
+    github_document:
+        toc: true
+        toc_depth: 2
+        df_print: paged
+---
+
+```{r options, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      echo = FALSE,
+                      cache = FALSE,
+                      cache.path = "../cache/composition_",
+                      cache.lazy = FALSE,
+                      fig.align = "left")
+## fig.path = "../cache/figCache/composition_",
+## fig.align = 'center')
+```
+
+```{r libraries}
+library(data.table) # data frame manipulation
+library(oligo)      # preprocessing oligonucleotide arrays
+library(limma)      # differential expression analysis
+library(AIMS)       # implements AIMS classifier (non-parametric version of PAM50)
+library(sva)        # implements ComBat
+library(ggplot2)    # sophisticated plotting framework
+library(ggsignif)   # significance bars for ggplot2
+library(irr)        # Cohen's Kappa
+library(knitr)      # kable function for tables
+library(kableExtra) # format kable tables
+library(SNAGEE)     # quality metric based on signal-to-noise ratio
+```
+
+```{r variables}
+## Directories
+rdsDir <- "../out/rds"
+csvDir <- "../data/csv"
+dsetDir <- "../data/rds"
+libDir <- "../lib"
+graphsDir <- "../out/pdf"
+hrmnDataDir <- "../eddie/data/out"
+
+## Affy Chips
+chips <- c("p2", "a")
+
+## Normalisation Methods
+normMths <- c("frma", "mas5", "rma")
+
+## Colours
+cols <- c("Basal" = "red2",
+          "Her2" = "purple",
+          "Luminal B" = "cadetblue2",
+          "Luminal A" = "dodgerblue4",
+          "Normal" = "forestgreen")
+
+## Seed
+set.seed(42)
+```
+
+```{r source, results = "hide"}
+scripts2source <- list.files(libDir)
+lapply(scripts2source, function(fl) source(file.path(libDir, fl)))
+```
+
+# 1---Dataset Acquisition #
+
+Raw CEL files from ten breast cancer gene expression dataset where downloaded
+from [GEO](https://www.ncbi.nlm.nih.gov/geo/) and normalized
+with
+[fRMA](https://bioconductor.org/packages/release/bioc/html/frma.html),
+[RMA](https://www.bioconductor.org/packages/release/bioc/html/oligo.html)
+and [MAS5](https://www.bioconductor.org/packages/release/bioc/html/affy.html).
+Demographics of each dataset are shown in **Table 1**.
+
+```{r datasets, eval = TRUE, cache = FALSE}
+## load datasets table
+dsets.dfr <- read.csv(file.path(csvDir, "datasets.csv"),
+                      stringsAsFactors = FALSE)
+dsets.dtb <- data.table(dsets.dfr)
+dsets.dtb[, platform := gsub("_", "", platform)]
+
+## split datasets by chip
+p2Dsets <- dsets.dtb[, id[grepl("p2", id)]]
+aDsets <- dsets.dtb[, id[!grepl("p2", id)]]
+```
+
+``` {r table-1, results = "asis", eval = TRUE, cache = FALSE}
+## setkey(dsets.dtb, id)
+dsets.dtb[, ':=' (dataset = NULL,
+                  from = NULL,
+                  notes = NULL)]
+setnames(dsets.dtb,
+         c("ref", "fracER", "fracHER2"),
+         c("GSE", "fracER+", "fracHER2+"))
+setcolorder(dsets.dtb,
+            c("GSE", "id", "platform", "nSamples", "fracER+", "fracHER2+"))
+setorder(dsets.dtb,
+         "platform", "fracER+", "fracHER2+")
+## sir-p2/GSE17907 has had 4 samples removed because they were not labeled HER2-
+## (see bellow)
+dsets.dtb[GSE == "GSE17907", nSamples := 33]
+kable(dsets.dtb[, -2, with = FALSE],
+      format = "html",
+      digits = 2,
+      caption = "Table 1---Demographics of datsets used in this study.") %>%
+    kable_styling(bootstrap_options = "striped",
+                  full_width = FALSE)
+```
+
+```{r expression-sets, eval = TRUE, cache = TRUE, results = "hide"}
+## load expression sets into memory
+eSet.lst <- setNames(lapply(normMths, function(normMth) {
+    setNames(lapply(dsets.dtb[["id"]], function(dsetId) {
+        readRDS(file.path(dsetDir,
+                          sprintf("%s-%s-affy.Rds",
+                                  dsetId, normMth)))
+    }), dsets.dtb[["id"]])
+}), normMths)
+
+## trim non her2 ihc positive samples from sir-p2 normalised datasets
+trimHer2Neg <- function(eset) eset[, sampleNames(eset)[eset$her2 == 1 & !is.na(eset$her2)]]
+eSet.lst[["frma"]][["sir-p2"]] <- trimHer2Neg(eSet.lst[["frma"]][["sir-p2"]])
+eSet.lst[["mas5"]][["sir-p2"]] <- trimHer2Neg(eSet.lst[["mas5"]][["sir-p2"]])
+eSet.lst[["rma"]][["sir-p2"]] <- trimHer2Neg(eSet.lst[["rma"]][["sir-p2"]])
+```
+
+# 2---Microarray Dataset Integration
+Microarray dataset integration needs to account for technical, non-biological,
+variation across multiple batches of independently acquired datasets.  The goal
+of conventional batch correction (BC) is to remove batch effects while retaining
+biological variation conveyed by each dataset.  Several methods exist to address
+this task.  One popular approach
+is [ComBat](https://www.bu.edu/jlab/wp-assets/ComBat/Abstract.html), which
+proposes "parametric and nonparametric empirical Bayes frameworks for adjusting
+data for batch effects that is robust to outliers in small sample sizes and
+performs comparable to existing methods for large samples".  However, most BC
+integration strategies do not account for imbalanced subtype composition within
+datasets.
+
+This manuscript introduces a novel procedure for integrating expression profile
+datasets of known dissimilar composition, called **subtype-aware batch
+correction** (SABC).  Molecular subtypes are initially assigned to each sample
+in each dataset with a publicly available single sample predictor (SSP).  Then,
+batch effects are resolved between datasets on a per-subtype basis.  This
+two-layered approach allows for the biological specifics captured by the single
+sample predictor of choice to be accounted for during the batch correction step,
+and thus carried over into the integrated dataset.  By ignoring distinct subtype
+compositions between datasets, conventional BC incorrectly apprehends biological
+variation as technical batch effect, and consequently distorts true biological
+signal in the integrated dataset.
+
+Breast cancer is widely understood to be subdivided into five intrinsic or
+molecular subtypes, which can be assigned by gene expression profile single
+sample predictors.  Breast cancer hence provides an ideal case stud y for the
+evaluation of SABC.  We used conventional BC and SABC to integrate four breast
+cancer datasets hybridized onto the Affymetrix HG-U133a chip and six breast
+cancer datasets hybridized onto the HG-U133 Plus2 chip (**Table 1**).
+
+To evaluate the performance of each method, we compared the distributions of
+expression values for
+the
+[205225\_at](https://genecards.weizmann.ac.il/cgi-bin/geneannot/GA_search.pl?keyword_type=probe_set_id&array=HG-U133&target=genecards&keyword=205225_at) and
+the
+[216836\_s\_at](https://genecards.weizmann.ac.il/cgi-bin/geneannot/GA_search.pl?keyword_type=probe_set_id&array=HG-U133&target=genecards&keyword=216836_s_at) probesets
+in each chip, respectively targeting for the *ESR1* and *ERBB2* gene
+transcripts.  Estrogen receptor (ESR1) and Erb-B2 Receptor Tyrosine Kinase 2
+receptor (ERBB2) status are strong predictors of breast cancer prognosis and are
+traditionally assessed by immunohistochemestry (IHC).  Post dataset integration,
+the expression values of both genes should remain in line with the biological
+signal conveyed by the independent assessment given by IHC for both proteins.
+In addition, we compared the agreement between single sample predictor class
+assignments for individual samples prior and post integration.  The batch
+correction procedure should not interfere with the molecular subtype identity of
+each sample, and for that reason higher agreement rates should be indicative of
+higher transcriptional fidelity of the integrated dataset.
+
+To guide the integration process with SABC, we used two SSPs implemented in
+the [Genefu](https://bioconductor.org/packages/release/bioc/html/genefu.html)
+Bioconductor package.  The
+first, [sorlie2003](http://www.pnas.org/content/100/14/8418), is based on 534
+diagnostic genes and is a five-subtype classifier; the
+second,
+[desmedts2008](http://clincancerres.aacrjournals.org/content/14/16/5158?ck=nck),
+is based on three genes (*ESR1*, *ERBB2* and *AURKA*), and is a three-subtype
+classifier.  To assess classifier agreement prior and post integration, and in
+order to circumvent the redundancy caused by using the same single sample
+predictor to integrate and to validate the integration process, we used the
+Genefu implementation of
+the [PAM50](http://ascopubs.org/doi/abs/10.1200/JCO.2008.18.1370) single sample
+predictor, based on 50 genes and yielding a five-subtype classifier.
+
+```{r pre-predictions, results = "hide", eval = TRUE, cache = TRUE}
+preds.dfr <- do.call(rbind,
+                     lapply(normMths, function(normMth) {
+                         do.call(rbind,
+                                 lapply(names(eSet.lst[[normMth]]), function(dset) {
+                                     eSet <- eSet.lst[[normMth]][[dset]]
+                                     e.mtx <- exprs(eSet) # expression matrix
+                                     a.dfr <- fData(eSet) # annotation data frame
+                                     dfr <- computePreds(e.mtx, a.dfr, doAIMS = FALSE, doIC10 = FALSE)
+                                     dfr[["dset"]] <- dset
+                                     dfr[["normMth"]] <- normMth
+                                     dfr
+                                 }))
+                     }))
+preds.dtb <- data.table(preds.dfr, key = "sampleName")
+## write preds.dtb on disk
+## write.csv(preds.dtb,
+##           file.path(csvDir, "prior-predictions.csv"))
+```
+
+```{r preprocess-integration, eval = TRUE, cache = TRUE, results = "hide"}
+## concatenated matrices
+cc.lst <- list()
+cc.lst[["p2"]] <- lapply(eSet.lst, function(lst) do.call(cbind, lapply(lst[p2Dsets], exprs)))
+cc.lst[["a"]] <- lapply(eSet.lst, function(lst) do.call(cbind, lapply(lst[aDsets], exprs)))
+## log2 mas5 normalised datasets
+cc.lst[["p2"]][["mas5"]] <- log2(cc.lst[["p2"]][["mas5"]])
+cc.lst[["a"]][["mas5"]] <- log2(cc.lst[["a"]][["mas5"]])
+## factor identifying datasets of origin for concatenated matrices
+fac.lst <- lapply(list(p2Dsets, aDsets),
+                  function(dsets) {
+                      factor(do.call(c,
+                                     lapply(dsets,
+                                            function(dset.id) {
+                                                setNames(rep(dset.id,
+                                                             dims(eSet.lst[[1]][[dset.id]])[[2]]),
+                                                         ## rep(dsets.dtb[id == dset.id, ref],
+                                                         rep(dsets.dtb[id == dset.id, GSE],
+                                                             dims(eSet.lst[[1]][[dset.id]])[[2]]))
+                                            })))
+                  })
+names(fac.lst) <- chips
+## factor with IHC ER status for datasets hybridised in each chip
+erStatus.lst <- list()
+erStatus.lst[["a"]] <- ordered(do.call(c, lapply(eSet.lst[[1]][aDsets], function(eSet) {
+    pData(eSet)[["er"]]
+})),
+levels = 0:1,
+labels = 0:1)
+erStatus.lst[["p2"]] <- ordered(do.call(c, lapply(eSet.lst[[1]][p2Dsets], function(eSet) {
+    pData(eSet)[["er"]]
+})),
+levels = 0:1,
+labels = 0:1)
+## factor with IHC HER2 status for datasets hybridised in each chip
+her2Status.lst <- list()
+her2Status.lst[["a"]] <- ordered(do.call(c, lapply(eSet.lst[[1]][aDsets], function(eSet) {
+    pData(eSet)[["her2"]]
+})),
+levels = 0:1,
+labels = 0:1)
+her2Status.lst[["p2"]] <- ordered(do.call(c, lapply(eSet.lst[[1]][p2Dsets], function(eSet) {
+    pData(eSet)[["her2"]]
+})),
+levels = 0:1,
+labels = 0:1)
+```
+
+```{r integrate, eval = TRUE, cache = TRUE, results = "hide"}
+## integration methods
+itg.lst <- list()
+## 1. BC
+itg.lst[["bc"]] <- lapply(chips, function(chip) {
+    chip.lst <- cc.lst[[chip]]
+    lapply(chip.lst, function(mtx){
+        ComBat(dat = mtx,
+               batch = fac.lst[[chip]])
+    })
+})
+names(itg.lst[["bc"]]) <- chips
+## 2. SABC
+## 2.1 with 3-subtype SSP
+itg.lst[["sabc3"]] <- lapply(chips, function(chip) {
+    setNames(lapply(names(cc.lst[[chip]]), function(nm) {
+        cc.mtx <- cc.lst[[chip]][[nm]]
+        doSubtypeCombat(mtx = cc.mtx,
+                        d.fac = fac.lst[[chip]],
+                        subtypePreds.fac = preds.dtb[normMth == nm][colnames(cc.mtx), subtype.desmedt2008])
+    }), names(cc.lst[[chip]]))
+})
+names(itg.lst[["sabc3"]]) <- chips
+## 2.2 with 5-subtype SSP
+itg.lst[["sabc5"]] <- lapply(chips, function(chip) {
+    setNames(lapply(names(cc.lst[[chip]]), function(nm) {
+        cc.mtx <- cc.lst[[chip]][[nm]]
+        doSubtypeCombat(mtx = cc.mtx,
+                        d.fac = fac.lst[[chip]],
+                        subtypePreds.fac = preds.dtb[normMth == nm][colnames(cc.mtx), intrinsic.sorlie2003])
+    }), names(cc.lst[[chip]]))
+})
+names(itg.lst[["sabc5"]]) <- chips
+## 3. Harman
+## read data
+hrmnFls <- list.files(hrmnDataDir, pattern = "Rds")
+hrmn.lst <- lapply(hrmnFls, function(flNm) readRDS(file.path(hrmnDataDir, flNm)))
+names(hrmn.lst) <- gsub("harman-integrated-(.*).Rds", "\\1", hrmnFls)
+## reconstruct corrected data
+hrmnCtd.lst <- lapply(hrmn.lst, reconstructData)
+## 3.1 with 5-subtype SSP
+itg.lst[["hrmn5"]] <- setNames(lapply(chips, function(chip) {
+    setNames(sapply(normMths, function(normMth) {
+        hrmnCtd.lst[sprintf("%s-%s", chip, normMth)]
+    }), normMths)
+}), chips)
+## 4. BC with covariate
+## 4.1 sith 5-suptype SSP
+itg.lst[["bccov5"]] <- lapply(chips, function(chip) {
+    chip.lst <- cc.lst[[chip]]
+    setNames(lapply(names(chip.lst), function(nrmMth) {
+        mtx <- chip.lst[[nrmMth]]
+        ComBat(dat = mtx,
+               batch = fac.lst[[chip]],
+               mod = model.matrix(~ as.factor(preds.dtb[normMth == nrmMth][colnames(mtx), intrinsic.sorlie2003])))
+    }), names(chip.lst))
+})
+names(itg.lst[["bccov5"]]) <- chips
+## write itg.lst on disk
+## saveRDS(itg.lst,
+##         file.path(rdsDir,
+##                   "integrated-matrices.Rds"))
+```
+
+```{r compute-nb-na-samples, eval = TRUE, cache = TRUE}
+## compute number of NA samples in each integrated matrix
+computeNbNASmpls <- function(mtx) {
+        sum(apply(mtx,
+                  2,
+                  function(x) sum(!is.na(x)) == 0))
+}
+nbNASmpls <- rapply(itg.lst,
+                    computeNbNASmpls,
+                    classes = "matrix",
+                    how = "unlist")
+nbNASmpls.dtb <- as.data.table(do.call(rbind, strsplit(names(nbNASmpls), split = "\\.")))
+setnames(nbNASmpls.dtb, c("itgMth", "chip", "nrmMth"))
+nbNASmpls.dtb[, nbNASmpls := nbNASmpls]
+## for each matrix, retrieve samples names for which all observations are NA
+retrieveNonNASmpls <- function(mtx) {
+    !apply(mtx,
+           2,
+           function(x) sum(!is.na(x)) == 0)
+}
+system.time(whichNonNASmplsNstd.lst <- rapply(itg.lst,
+                                              retrieveNonNASmpls,
+                                              class = "matrix",
+                                              how = "list"))
+whichNonNASmpls.lst <- do.call(c, unlist(whichNonNASmplsNstd.lst, recursive = FALSE))
+mcdSmpls.lst <- lapply(chips, function(chip) {
+    Reduce("&", whichNonNASmpls.lst[grepl(sprintf("\\.%s\\.", chip), names(whichNonNASmpls.lst))])
+})
+names(mcdSmpls.lst) <- chips
+```
+
+## 2.1---Distortion of Molecular *ESR1* and *ERBB2* Measurements ##
+
+```{r er-boxplots-preprocess, eval = TRUE, cache = TRUE}
+## read itg.lst from disk
+## itg.lst <- readRDS(file.path(rdsDir,
+##                              "integrated-matrices.Rds"))
+## From these, we happen to know that the best probeset to represent ESR1
+## expression is 205225_at (courtesy of Andy)
+esr1Probe <- "205225_at"    # Andy Sims
+erbb2Probe <- "216836_s_at" # Nicholas Moir
+## build a data table containing relevant information to plot:
+## .sample name
+## .dataset
+## .chip (a or p2)
+## .IHC receptor (er or her2)
+## .IHC status for receptor (zero or one)
+## .values of expression for corresponding diagnostic probe
+## .method of correction (nc, bc, sabc3 or sabc5)
+## .normalisation procedure (frma, rma or mas5)
+cbn.dfr <- expand.grid(chip = chips,
+                       ihc.marker = c("er", "her2"),
+                       itg.method = c("nc", "bc", "sabc3", "sabc5", "hrmn5", "bccov5"),
+                       nrm.method = c("frma", "rma", "mas5"),
+                       stringsAsFactors = FALSE)
+buildBxpltData <- function(chip,
+                           ihc.marker,
+                           itg.method,
+                           nrm.method) {
+    prb <- ifelse(ihc.marker == "er", esr1Probe, erbb2Probe)
+    if(ihc.marker == "er") {
+        status.lst <- erStatus.lst
+    } else {
+        status.lst <- her2Status.lst
+    }
+    if(itg.method == "nc") {
+        mtx <- cc.lst[[chip]][[nrm.method]]
+    } else {
+        mtx <- itg.lst[[itg.method]][[chip]][[nrm.method]]
+    }
+    data.table(sampleName = colnames(mtx),
+               dataset = names(fac.lst[[chip]]),
+               chip = chip,
+               ihc.marker = ihc.marker,
+               ihc.status = status.lst[[chip]],
+               expr = mtx[prb, ],
+               itg.method = itg.method,
+               nrm.method = nrm.method)
+}
+bxplt.dtb <- do.call(rbind,
+                     mapply(buildBxpltData,
+                            chip = cbn.dfr[["chip"]],
+                            ihc.marker = cbn.dfr[["ihc.marker"]],
+                            itg.method = cbn.dfr[["itg.method"]],
+                            nrm.method = cbn.dfr[["nrm.method"]],
+                            SIMPLIFY = FALSE))
+## remove samples for which ihc status is unknown
+bxplt.dtb <- bxplt.dtb[!is.na(ihc.status) & !is.na(expr)]
+## write bxplt.dtb on disk
+## write.csv(bxplt.dtb,
+##           file.path(csvDir, "boxplot-data.csv"))
+```
+
+We compared the distributions of expression values prior and post dataset
+integration for the 205225_at probeset in 840 breast tumours, hybridised onto
+the HG-U133a chip, from four datasets with distinct fractions of ER+ samples
+(**Table 1** and **Fig.1**).  Regardless of the normalisation method, BC
+integration significantly distorts *ESR1* expression measurements in samples
+from datasets with extreme fractions of ER+ samples (GSE5327 and GSE17705), to
+the point where the two distributions no longer can tell the difference between
+ER-- and ER+ samples (**Fig.2**, second column of panels).  In both cases, SABC
+integration, whether driven by a 3-subtype SSP (SABC3) or a 5-subtype SSP
+(SABC5), succeeds in retaining the biological signal conveyed by the IHC status
+in datasets with extreme compositions (**Fig.2**, third and fourth columns of
+panels).  Further comparison of ESR1 transcript abundance in these two datasets
+prior and post integration reveals that expression values depart significantly
+from original measurements when datasets are integrated with BC, yet are
+preserved from extreme distortion by SABC integration (**Fig.3**).
+
+```{r er-a-boxplots, fig.height = 6, fig.width = 9, eval = TRUE, fig.cap = 'Figure 1---205225_at probeset measurements hybridised onto the HG-U133a chip broken by dataset prior and post integration.  Integration was done using standard batch correction (BC, with ComBat) and subtype-aware batch correction (SABC3, driven by a three-subtype SSP; and SABC5, driven by a five-subtype SSP).  The distributions are further split by ER status, independently assessed by IHC on fresh frozen specimens.  Raw data was normalised with FRMA, RMA and MAS5.'}
+ggplot(bxplt.dtb[chip == "a" &
+                 ihc.marker == "er" &
+                 !is.na(ihc.status) &
+                 itg.method %in% c("nc", "bc", "sabc3", "sabc5") &
+                 ## nrm.method == "frma" &
+                 !is.na(expr)],
+       aes(x = ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE25065",
+                                  "GSE2034",
+                                  "GSE17705")),
+           y = expr,
+           colour = ordered(ihc.status,
+                            levels = 0:1,
+                            labels = c("ER-", "ER+")))) +
+    geom_boxplot() +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    scale_y_continuous(limits = c(2.5, 14)) +
+    scale_colour_manual(name = "IHC ER Status",
+                        values = c("violetred", "steelblue")) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "bc",
+                                      "sabc3",
+                                      "sabc5"),
+                           labels = c("Prior to Integration",
+                                      "BC",
+                                      "SABC3",
+                                      "SABC5")),
+               scales = "free") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 14),
+          legend.position = "top",
+          legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16))
+## ggsave(file.path(graphsDir, "integrate-er-boxplots-a-frma.pdf"),
+##        width = 11,
+##        height = 6)
+```
+
+```{r er-p2-boxplot, fig.height = 8, fig.width = 10, eval = FALSE}
+ggplot(bxplt.dtb[dataset %in% c("GSE16446",
+                                "GSE23177") &
+                 chip == "p2" &
+                 ihc.marker == "er"],
+       aes(x = ordered(itg.method,
+                       levels = c("nc", "bc", "sabc3", "sabc5"),
+                       labels = c("Prior to Integration",
+                                  "BC",
+                                  "SABC3",
+                                  "SABC5")),
+           y = expr)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(5, 18)) +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    geom_signif(comparisons = list(c("Prior to Integration", "BC"),
+                                   c("Prior to Integration", "SABC3"),
+                                   c("Prior to Integration", "SABC5")),
+                y_position = c(15.0,
+                               16.2,
+                               17.4),
+                test = "t.test",
+                textsize = 3,
+                tip_length = 0) +
+    facet_grid(ordered(dataset,
+                       levels = c("GSE16446",
+                                  "GSE23177"),
+                       labels = c("GSE16446 (0% ER+)",
+                                  "GSE23177 (100% ER+)")) ~
+                   ordered(nrm.method,
+                           levels = c ("frma",
+                                       "rma",
+                                       "mas5"),
+                           labels = c("FRMA",
+                                      "RMA",
+                                      "MAS5"))) +
+    ggtitle("HG-U133Plus2") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 14),
+          plot.title = element_text(size = 16))
+## ggsave(file.path(graphsDir, "comparisons-extreme-datasets-plus2.pdf"),
+##        width = 11,
+##        height = 5)
+```
+
+```{r er-a-extreme-datasets-by-er-status, fig.height = 5, fig.width = 8, eval = TRUE, fig.cap = 'Figure 2---Distributions of probeset 205225_at measurements from datasets GSE5327 (n=58, all ER--) and GSE17705 (n=298, all ER+), taken from **Fig.1**, are compared side by side. See **Fig.1** for details.'}
+ggplot(bxplt.dtb[dataset %in% c("GSE5327",
+                                "GSE17705") &
+                 chip == "a" &
+                 itg.method %in% c("nc", "bc", "sabc3", "sabc5") &
+                 ihc.marker == "er"],
+       aes(x = ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE17705"),
+                       labels = c("GSE5327\n0% ER+",
+                                  "GSE17705\n100% ER+")),
+           y = expr)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(5, 18)) +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    geom_signif(comparisons = list(c("GSE5327\n0% ER+",
+                                     "GSE17705\n100% ER+")),
+                y_position = 16,
+                vjust = -.4,
+                test = "t.test",
+                textsize = 3.6,
+                tip_length = 0) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "bc",
+                                      "sabc3",
+                                      "sabc5"),
+                           labels = c("Prior to Integration",
+                                      "BC",
+                                      "SABC3",
+                                      "SABC5")),
+               scales = "free") +
+    ## ggtitle("HG-U133a") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 12),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 12),
+          plot.title = element_text(size = 16))
+## ggsave(file.path(graphsDir, "comparisons-extreme-datasets-a.pdf"),
+##        width = 11,
+##        height = 5)
+```
+
+```{r er-a-extreme-datasets-by-integration, fig.height = 5, fig.width = 7, eval = TRUE, fig.cap = 'Figure 3---Distributions of probeset 205225_at measurements from datasets GSE5327 (n=58, all ER--) and GSE17705 (n=298, all ER+), taken from **Fig.1**, are each compared prior and post dataset integration.  See **Fig.1** for details.'}
+ggplot(bxplt.dtb[dataset %in% c("GSE5327",
+                                "GSE17705") &
+                 chip == "a" &
+                 ihc.marker == "er"],
+       aes(x = ordered(itg.method,
+                       levels = c("nc", "bc", "sabc3", "sabc5"),
+                       labels = c("Prior to\nIntegration",
+                                  "BC",
+                                  "SABC3",
+                                  "SABC5")),
+           y = expr)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(5, 18)) +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    geom_signif(comparisons = list(c("Prior to\nIntegration", "BC"),
+                                   c("Prior to\nIntegration", "SABC3"),
+                                   c("Prior to\nIntegration", "SABC5")),
+                y_position = c(15.0,
+                               16.2,
+                               17.4),
+                test = "t.test",
+                textsize = 3,
+                tip_length = 0) +
+    facet_grid(ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE17705"),
+                       labels = c("GSE5327 (0% ER+)",
+                                  "GSE17705 (100% ER+)")) ~
+                   ordered(nrm.method,
+                           levels = c ("frma",
+                                       "rma",
+                                       "mas5"),
+                           labels = c("FRMA",
+                                      "RMA",
+                                      "MAS5"))) +
+    ## ggtitle("HG-U133a") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 12),
+          axis.title = element_text(size = 16),
+          strip.text.x = element_text(size = 12),
+          strip.text.y = element_text(size = 11),
+          plot.title = element_text(size = 16))
+## ggsave(file.path(graphsDir, "comparisons-extreme-datasets-a.pdf"),
+##        width = 11,
+##        height = 5)
+```
+
+```{r er-p2-boxplots, fig.height = 6, fig.width = 11, eval = FALSE, fig.cap = 'Figure 2---205225_at probeset measurements hybridised onto the HG-U133Plus2 chip. Refer to **Fig.1** for further details.'}
+## read bxplt.dtb from disk
+## bxplt.dfr <- read.csv(file.path(csvDir, "boxplot-data.csv"),
+##                       row.names = 1)
+## bxplt.dtb <- data.table(bxplt.dfr, keep.rownames = FALSE)
+ggplot(bxplt.dtb[chip == "p2" &
+                 ihc.marker == "er" &
+                 !is.na(ihc.status) &
+                 itg.method %in% c("nc", "sabc5", "bccov5", "hrmn5") &
+                 ## nrm.method == "frma" &
+                 !is.na(expr)],
+       aes(x = ordered(dataset,
+                       levels = c("GSE16446",
+                                  "GSE2109",
+                                  "GSE21653",
+                                  "GSE5460",
+                                  "GSE17907",
+                                  "GSE23177")),
+           y = expr,
+           colour = ordered(ihc.status,
+                            levels = 0:1,
+                            labels = c("ER-", "ER+")))) +
+    geom_boxplot() +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    scale_y_continuous(limits = c(2.5, 14)) +
+    scale_colour_manual(name = "IHC ER Status",
+                        values = c("violetred", "steelblue")) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "bc",
+                                      "sabc3",
+                                      "sabc5"),
+                           labels = c("Prior to Integration",
+                                      "BC",
+                                      "SABC3",
+                                      "SABC5")),
+               scales = "free") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 14),
+          legend.position = "top",
+          legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16))
+## ggsave(file.path(graphsDir, "integrate-er-boxplots-p2-frma.pdf"),
+##        width = 11,
+##        height = 6)
+```
+
+```{r her2-p2-boxplots, fig.height = 6, fig.width = 10, eval = FALSE, fig.cap = 'Figure 3---216836_s_at probeset measurements hybridised onto the HG-U133Plus2 chip. Refer to **Fig.1** for further details.'}
+ggplot(bxplt.dtb[chip == "p2" &
+                 ihc.marker == "her2" &
+                 !is.na(ihc.status) &
+                 ## nrm.method == "frma" &
+                 !is.na(expr)],
+       aes(x = ordered(dataset,
+                       levels = c("GSE23177",
+                                  "GSE16446",
+                                  "GSE2109",
+                                  "GSE21653",
+                                  "GSE5460",
+                                  "GSE17907")),
+           y = expr,
+           colour = ordered(ihc.status,
+                            levels = 0:1,
+                            labels = c("HER2-", "HER2+")))) +
+    geom_boxplot() +
+    xlab("") +
+    ylab("ERBB2 (216836_s_at)") +
+    scale_y_continuous(limits = c(2.5, 14)) +
+    scale_colour_manual(name = "IHC HER2 Status",
+                        values = c("darkorange", "navyblue")) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "bc",
+                                      "sabc3",
+                                      "sabc5"),
+                           labels = c("Prior to Integration",
+                                      "BC",
+                                      "SABC3",
+                                      "SABC5")),
+               scales = "free") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 14),
+          legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16))
+ggsave(file.path(graphsDir, "integrate-her2-boxplots-p2.pdf"),
+       width = 9,
+       height = 4)
+```
+
+Although less pronounced, a similar trend is observed when comparing the
+expression values prior and post- dataset integration for the 216836_s_at
+probeset, in 1015 breast tumours hybridised onto the HG-U133Plus2 chip, from six
+datasets with distinct proportions of HER2+ samples (**Table 1** and **Fig.4**).
+Regardless of the normalisation protocol, The ERBB2 probeset distributions
+clearly reflect the IHC HER2 receptor status in the two datasets in our analysis
+with extreme HER2 compositions (GSE23177, all HER2--; and GSE17907, all HER2+).
+When the five datasets are integrated with BC, this biological signal is erased,
+yet preserved (albeit to a lesser extent than in the original datasets), when
+integrated with SABC3 and SABC5 (**Fig.4**).
+
+```{r her2-p2-extreme-datasets-by-her-status, fig.height = 5, fig.width = 8, eval = TRUE, fig.cap = 'Figure 4---216836_s_at probeset measurements hybridised onto the HG-U133Plus2 chip are shown for datasets GSE23177 (n=116, all HER2--) and GSE17907 (n=37, all HER2+), in the leftmost column.  These two datasets were integrated with GSE16446, GSE21653, GSE5460 and GSE2109 (**Table 1**), with BC, SABC3 and SABC5.  ERBB2 expression values for the samples in the two datasets with extreme HER2+ compositions are then shown post-integration with each of these methods, broken by normalisation procedure (cf. **Fig.1** for more details).'}
+ggplot(bxplt.dtb[dataset %in% c("GSE23177",
+                                "GSE17907") &
+                 chip == "p2" &
+                 itg.method %in% c("nc", "bc", "sabc3", "sabc5") &
+                 ihc.marker == "her2"],
+       aes(x = ordered(dataset,
+                       levels = c("GSE23177",
+                                  "GSE17907"),
+                       labels = c("GSE23177\n0% HER2+",
+                                  "GSE17907\n100% HER2+")),
+           y = expr)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(7, 18)) +
+    xlab("") +
+    ylab("ERBB2 (216836_s_at)") +
+    geom_signif(comparisons = list(c("GSE23177\n0% HER2+",
+                                     "GSE17907\n100% HER2+")),
+                y_position = 16,
+                vjust = -.4,
+                test = "t.test",
+                textsize = 3.6,
+                tip_length = 0) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "bc",
+                                      "sabc3",
+                                      "sabc5"),
+                           labels = c("Prior to Integration",
+                                      "BC",
+                                      "SABC3",
+                                      "SABC5")),
+               scales = "free") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 12),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 12))
+```
+
+The different degree to which subtype-aware batch correction successfully
+retains biological signal from these two molecular correlates of breast cancer
+biology, in datasets with extreme compositions, could be explained by how well
+the classifiers used to drive integration capture the underlying biology of the
+ER and HER2 receptors.  Because the clinical HER2 breast cancer phenotype is the
+result of a gene amplification, it is possible that gene expression classifiers
+are less apt to model binary gene expression distributions (HER2) rather than
+continuous ones (ER).  In addition, the top level split highlighted by most
+molecular characterisations of breast tumours is lead by ER status, consigning
+most SSP derived from molecular data to be particularly sensitive to biological
+signal conveyed by this marker.
+
+## 2.2---Single Sample Predictor Agreement ##
+
+Single sample predictor assignments for the Genefu implementation of the PAM50
+breast cancer classifier were computed for each of the 1015 samples in GSE2109,
+GSE21653, GSE5460, GSE16446, GSE23177 and GSE17907, after FRMA normalisation
+(**Table 1**).  We then integrated the six datasets with BC, SABC3 and SABC5,
+and computed each sample's PAM50 subtype post-integration.  Comparisons of
+subtype assignments prior- and post-integration can be seen on **Fig.5**.
+
+``` {r post-predictions, eval = TRUE, cache = TRUE}
+itgMths <- names(itg.lst)
+annot.lst <- list()
+annot.lst[["p2"]] <- fData(eSet.lst[[1]][p2Dsets][[1]])
+annot.lst[["a"]] <- fData(eSet.lst[[1]][aDsets][[1]])
+postPreds.dfr <- do.call(rbind,
+                         lapply(itgMths, function(itgMth) {
+                             do.call(rbind,
+                                     lapply(chips, function(chip) {
+                                         do.call(rbind,
+                                                 lapply(normMths, function(normMth) {
+                                                     e.mtx <- itg.lst[[itgMth]][[chip]][[normMth]]
+                                                     a.dfr <- annot.lst[[chip]]
+                                                     dfr <- computePreds(e.mtx,
+                                                                         a.dfr,
+                                                                         doAIMS = FALSE,
+                                                                         doIC10 = FALSE)
+                                                     dfr[["itgMth"]] <- itgMth
+                                                     ## dfr[["chip"]] <- chip
+                                                     dfr[["normMth"]] <- normMth
+                                                     dfr
+                                                 }))
+                                     }))
+                         }))
+postPreds.dtb <- data.table(postPreds.dfr, key = "sampleName")
+crs.dtb <- unique(preds.dtb[, .(sampleName, dset)])
+setkey(crs.dtb, sampleName)
+postPreds.dtb <- crs.dtb[postPreds.dtb]
+## postPreds.dtb[, priorPost := "post"]
+## preds.dtb[, ':='(priorPost = "prior",
+##                  itgMth = NA)]
+preds.dtb[, itgMth := "nc"]
+setcolorder(preds.dtb, names(postPreds.dtb))
+priorPostPreds.dtb <- rbind(preds.dtb, postPreds.dtb)
+gse.dtb <- dsets.dtb[, .(GSE, id)]
+setnames(gse.dtb, c("gse", "dset"))
+setkey(gse.dtb, dset)
+setkey(priorPostPreds.dtb, dset)
+priorPostPreds.dtb <- gse.dtb[priorPostPreds.dtb]
+priorPostPreds.dtb[, chip := gsub("(.*)-(.*)", "\\2", dset)]
+```
+
+```{r pam50-concordance, eval = TRUE, cache = TRUE}
+## frma normalisation and Plus2 chip
+pam50.dtb <- dcast.data.table(priorPostPreds.dtb[normMth == "frma" &
+                                                 chip == "p2"],
+                              sampleName + gse ~ itgMth,
+                              value.var = "intrinsic.pam50")
+## reorder samples by
+## 1. dataset
+## 2. subtype
+## 3. number of concordant observations
+set(pam50.dtb,
+    j = "nUnq",
+    value = apply(pam50.dtb[,
+                            .(bc, nc, sabc3, sabc5)],
+                  1,
+                  function(x) length(unique(x))))
+pam50.dtb[, sampleName := ordered(sampleName,
+                                  levels = sampleName[order(gse,
+                                                            nc,
+                                                            nUnq)])]
+pam50.dtb[, gse := ordered(gse,
+                           levels = pam50.dtb[,
+                                              .N,
+                                              by = gse][,
+                                                        gse[order(-N)]])]
+## melt
+pam50Mlt.dtb <- melt(pam50.dtb,
+                     id.vars = c("sampleName",
+                                 "gse",
+                                 "nUnq"))
+setnames(pam50Mlt.dtb, "variable", "itgMth")
+setnames(pam50Mlt.dtb, "value", "pam50")
+pam50Mlt.dtb[, pam50 := ordered(pam50,
+                                levels = c("Basal",
+                                           "Her2",
+                                           "LumA",
+                                           "LumB",
+                                           "Normal"),
+                                labels = c("Basal",
+                                           "Her2",
+                                           "Luminal A",
+                                           "Luminal B",
+                                           "Normal"))]
+pam50Mlt.dtb[, itgMth := ordered(itgMth,
+                                 levels = c("nc",
+                                            "bc",
+                                            "sabc3",
+                                            "sabc5",
+                                            "bccov5",
+                                            "hrmn5"),
+                                 labels = c("Prior to\nIntegration",
+                                            "BC",
+                                            "SABC3",
+                                            "SABC5",
+                                            "BCCOV5",
+                                            "HRMN5"))]
+```
+
+```{r pam50-concordance-plot, fig.height = 5, fig.width = 9, fig.cap = 'Figure 5---PAM50 subtype assignments for 1015 samples from six datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  Subtype assignements were computed prior to dataset integration (first row) and post integration with BC, SABC3 and SABC5 (subsequent rows).'}
+gseLvls <- pam50Mlt.dtb[, levels(gse)]
+gseLbls <- gseLvls
+gseLbls[length(gseLbls)] <- sprintf("GSE\n%s", gsub("GSE", "", gseLvls[length(gseLbls)]))
+## pam50Mlt.dtb[, gse := ordered(gse,
+##                               levels = levels(gse),
+##                               labels = gseLbls)]
+ggplot(pam50Mlt.dtb[!itgMth %in% c("BCCOV5", "HRMN5")],
+       aes(x = sampleName,
+           y = 1,
+           fill = pam50,
+           colour = pam50)) +
+  geom_tile() +
+  scale_fill_manual(values = cols) +
+  scale_colour_manual(values = cols) +
+    facet_grid(itgMth ~ ordered(gse,
+                                levels = levels(gse),
+                                labels = gseLbls),
+               scale = "free",
+               space = "free") +
+  theme_bw() +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
+```
+
+```{r p2-kvals, eval = TRUE, cache = TRUE}
+## functions to compute k-values
+getKval <- function(dfr) kappa2(dfr)[["value"]]
+k.lst <- list()
+k.lst[["all"]] <- sapply(itgMths, function(itgMth) {
+    getKval(pam50.dtb[, c("nc", itgMth), with = FALSE])
+})
+setkey(pam50.dtb, gse)
+gses <- pam50.dtb[, levels(gse)]
+k.lst <- c(k.lst,
+           setNames(lapply(gses, function(gse) {
+               sapply(itgMths, function(itgMth) {
+                   getKval(pam50.dtb[gse,
+                                     c("nc", itgMth),
+                                     with = FALSE])
+  })
+}), gses))
+k.dtb <- data.table(do.call(rbind,
+                            k.lst),
+                    keep.rownames = TRUE)
+setnames(k.dtb, "rn", "GSE")
+setkey(k.dtb, GSE)
+setkey(dsets.dtb, GSE)
+k.dtb <- dsets.dtb[, c("GSE",
+                       "nSamples",
+                       "fracER+",
+                       "fracHER2+"),
+                   with = FALSE][k.dtb]
+setnames(k.dtb,
+         c("GSE", "nSamples", "fracER+", "fracHER2+",
+           sprintf("Cohen's Kappa: %s",
+                   toupper(itgMths))))
+k.dtb[GSE == "all", nSamples := k.dtb[, sum(nSamples, na.rm = TRUE)]]
+setorder(k.dtb, -nSamples)
+```
+
+```{r table-2, results = "asis", eval = TRUE}
+kable(k.dtb,
+      format = "html",
+      digits = 2,
+      caption = "Table 2---Interrater agreement of PAM50 subtype assessment prior- and post-dataset integration (see text for details).") %>%
+    kable_styling(bootstrap_options = "striped",
+                  full_width = FALSE)
+```
+
+With the exception of the largest dataset, GSE2109, PAM50 interrater agreement
+was always higher with SABC integration than with conventional integration.
+Incidentally, the datasets that showed lesser subtype agreement post BC
+integration are the ones with most extreme ER and HER2 compositions (GSE16446,
+GSE23177 and GSE17907).  For these datasets, SABC integration was able to
+increase subtype assignment agreement (with the exception of SABC3 for
+GSE23177).
+
+Because sample size can further confound the effect of dataset composition
+towards retention of biological signal post-integration, we compared the
+PAM50 interrate agreement prior and post-integration for datasets GSE2109,
+GSE21653, GSE5460, GSE16446 and GSE23177, sampling in each dataset, 116 samples
+with the same IHC ER+ proportions as the original datasets.  Comparisons of
+subtype assignements prior and post-integration in this experiment can be seen
+in **Fig.6** and **Table 3**.
+
+```{r integrate-proportions, eval = TRUE, cache = TRUE, results = "hide"}
+ppGses <- c("GSE2109", "GSE21653", "GSE5460", "GSE16446", "GSE23177")
+ppIds <- dsets.dtb[GSE %in% ppGses, id]
+## 116 is the minimum number of samples
+minSmpls <- min(sapply(eSet.lst[["frma"]][ppIds], dim)["Samples", ])
+## retrieve expression sets with the minimum number of samples that respect the
+## original fraction of ER+ samples
+shrinkEset <- function(eset,
+                       nSmpls) {
+    fracErPos <- sum(eset$er == 1, na.rm = TRUE) / sum(!is.na(eset$er))
+    nSmplsErPos <- round(nSmpls * fracErPos)
+    nSmplsErNeg <- nSmpls - nSmplsErPos
+    erPosSmpls <- sample(sampleNames(eset)[eset$er == 1 & !is.na(eset$er)], nSmplsErPos)
+    erNegSmpls <- sample(sampleNames(eset)[eset$er == 0 & !is.na(eset$er)], nSmplsErNeg)
+    eset[, c(erPosSmpls, erNegSmpls)]
+}
+## only frma normalised data
+ppShrunk.lst <- lapply(eSet.lst[["frma"]][ppIds],
+                       shrinkEset,
+                       nSmpls = minSmpls)
+## compute prior predictions
+ppPreds.dfr <- do.call(rbind,
+                       lapply(names(ppShrunk.lst), function(dset) {
+                           eSet <- ppShrunk.lst[[dset]]
+                           e.mtx <- exprs(eSet)
+                           a.dfr <- fData(eSet)
+                           dfr <- computePreds(e.mtx,
+                                               a.dfr,
+                                               doAIMS = FALSE,
+                                               doIC10 = FALSE)
+                           dfr[["dset"]] <- dset
+                           dfr
+}))
+## concatenate
+ppCc.mtx <- do.call(cbind, lapply(ppShrunk.lst, exprs))
+pp.fac <- factor(do.call(c, lapply(names(ppShrunk.lst), function(dset) {
+    rep(dset, ncol(ppShrunk.lst[[dset]]))
+})))
+## integrate
+ppItg.lst <- list()
+ppItg.lst[["bc"]] <- ComBat(dat = ppCc.mtx,
+                            batch = pp.fac)
+ppItg.lst[["sabc3"]] <- doSubtypeCombat(mtx = ppCc.mtx,
+                                        d.fac = pp.fac,
+                                        subtypePreds.fac = ppPreds.dfr$subtype.desmedt2008)
+ppItg.lst[["sabc5"]] <- doSubtypeCombat(mtx = ppCc.mtx,
+                                        d.fac = pp.fac,
+                                        subtypePreds.fac = ppPreds.dfr$intrinsic.sorlie2003)
+## compute post predictions
+ppPost.dfr <- do.call(rbind,
+                      lapply(names(ppItg.lst), function(itgMth) {
+                          e.mtx <- ppItg.lst[[itgMth]]
+                          a.dfr <- annot.lst[["p2"]]
+                          dfr <- computePreds(e.mtx, a.dfr, doAIMS = FALSE, doIC10 = FALSE)
+                          dfr[["itgMth"]] <- itgMth
+                          dfr
+}))
+ppPost.dtb <- data.table(ppPost.dfr, key = "sampleName")
+ppPost.dtb <- crs.dtb[ppPost.dtb]
+ppPreds.dtb <- data.table(ppPreds.dfr)
+ppPreds.dtb[, itgMth := "nc"]
+setcolorder(ppPreds.dtb, names(ppPost.dtb))
+ppPriorPost.dtb <- rbind(ppPreds.dtb, ppPost.dtb)
+setkey(ppPriorPost.dtb, dset)
+ppPriorPost.dtb <- gse.dtb[ppPriorPost.dtb]
+ppPriorPost.dtb[, chip := gsub("(.*)-(.*)", "\\2", dset)]
+## pam50
+ppPam50.dtb <- dcast.data.table(ppPriorPost.dtb,
+                                sampleName + gse ~ itgMth,
+                                value.var = "intrinsic.pam50")
+set(ppPam50.dtb,
+    j = "nUnq",
+    value = apply(ppPam50.dtb[,
+                            .(bc, nc, sabc3, sabc5)],
+                  1,
+                  function(x) length(unique(x))))
+ppPam50.dtb[, sampleName := ordered(sampleName,
+                                    levels = sampleName[order(gse,
+                                                              nc,
+                                                              nUnq)])]
+ppPam50.dtb[, gse := ordered(gse,
+                             levels = ppPam50.dtb[,
+                                                  .N,
+                                                  by = gse][,
+                                                            gse[order(-N)]])]
+ppPam50Mlt.dtb <- melt(ppPam50.dtb,
+                       id.vars = c("sampleName",
+                                   "gse",
+                                   "nUnq"))
+setnames(ppPam50Mlt.dtb, "variable", "itgMth")
+setnames(ppPam50Mlt.dtb, "value", "pam50")
+ppPam50Mlt.dtb[, pam50 := ordered(pam50,
+                                  levels = c("Basal",
+                                             "Her2",
+                                             "LumA",
+                                             "LumB",
+                                             "Normal"),
+                                  labels = c("Basal",
+                                             "Her2",
+                                             "Luminal A",
+                                             "Luminal B",
+                                             "Normal"))]
+ppPam50Mlt.dtb[, itgMth := ordered(itgMth,
+                                   levels = c("nc", "bc", "sabc3", "sabc5"),
+                                   labels = c("Prior to\nIntegration",
+                                              "BC",
+                                              "SABC3",
+                                              "SABC5"))]
+```
+
+```{r pam50-concordance-proportions-plot, fig.height = 5, fig.width = 9, fig.cap = 'Figure 6---PAM50 subtype assignments for 580 samples from five datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  For each dataset, 116 samples were randomly selected in order to respect the original IHC ER+ fraction.  Subtype assignments were computed prior- (top row) and post- (subsequent rows) dataset integration with BC, SABC3 and SABC5.'}
+ggplot(ppPam50Mlt.dtb, aes(x = sampleName,
+                           y = 1,
+                           fill = pam50,
+                           colour = pam50)) +
+  geom_tile() +
+  scale_fill_manual(values = cols) +
+  scale_colour_manual(values = cols) +
+    facet_grid(itgMth ~ ordered(gse,
+                                levels = levels(gse)),
+               scale = "free",
+               space = "free") +
+  theme_bw() +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.text.x = element_text(size = 8),
+        strip.text.y = element_text(size = 8))
+```
+
+```{r p2-kvals-proportions, eval = TRUE, cache = TRUE}
+ppK.lst <- list()
+itgMthsRdx <- c("bc", "nc", "sabc3", "sabc5")
+ppK.lst[["all"]] <- sapply(itgMthsRdx, function(itgMth) {
+    getKval(ppPam50.dtb[, c("nc", itgMth), with = FALSE])
+})
+setkey(ppPam50.dtb, gse)
+gses <- ppPam50.dtb[, levels(gse)]
+ppK.lst <- c(ppK.lst,
+             setNames(lapply(gses, function(gse) {
+                 sapply(itgMthsRdx, function(itgMth) {
+                     getKval(ppPam50.dtb[gse,
+                                         c("nc", itgMth),
+                                         with = FALSE])
+                 })
+             }), gses))
+ppK.dtb <- data.table(do.call(rbind,
+                              ppK.lst),
+                      keep.rownames = TRUE)
+setnames(ppK.dtb, "rn", "GSE")
+setkey(ppK.dtb, GSE)
+setkey(dsets.dtb, GSE)
+ppK.dtb <- dsets.dtb[, c("GSE",
+                         "nSamples",
+                         "fracER+",
+                         "fracHER2+"),
+                     with = FALSE][ppK.dtb]
+setnames(ppK.dtb,
+         c("GSE", "nSamples", "fracER+", "fracHER2+",
+           sprintf("Cohen's Kappa: %s",
+                   toupper(itgMthsRdx))))
+ppK.dtb[GSE != "all", nSamples := 116]
+ppK.dtb[GSE == "all", nSamples := ppK.dtb[, sum(nSamples, na.rm = TRUE)]]
+setorder(ppK.dtb, -nSamples)
+```
+
+```{r table-3, results = "as.is", eval = TRUE}
+kable(ppK.dtb,
+      format = "html",
+      digits = 2,
+      caption =
+          "Table 3---Interrater agreement of PAM50 subtype assessment prior- and post-dataset integration, with datasets brought down to the same size (see text for details).") %>%
+    kable_styling(bootstrap_options = "striped",
+                  full_width = FALSE)
+```
+
+```{r dea, eval = FALSE, cache = TRUE}
+getDiffExprGns <- function(gse,                # dataset to extract phenotype from
+                           nGenes = 1e2,       # number of top genes to retrieve from analysis
+                           marker = "grade") { # %in% c("grade", "grade")
+    stopifnot(marker %in% c("grade", "er"))
+    eset <- eSet.lst[["frma"]][[dsets.dtb[GSE == gse, id]]]
+    a.dtb <- data.table(fData(eset),
+                        keep.rownames = TRUE,
+                        key = "rn")
+    if(marker == "grade") {
+        smpls2kp <- sampleNames(eset)[eset$grade %in% 2:3]
+    } else {
+        smpls2kp <- sampleNames(eset)[eset$er %in% 0:1]
+    }
+    ## prior integration
+    esetPrior <- eset[, smpls2kp]
+    if(marker == "grade") {
+        m.mtx <- model.matrix(~ esetPrior$grade == 2)
+    } else {
+        m.mtx <- model.matrix(~ esetPrior$er == 0)
+    }
+    fitPrior <- lmFit(esetPrior,
+                      m.mtx)
+    fitPrior <- eBayes(fitPrior)
+    prior.dtb <- data.table(topTable(fitPrior,
+                                     coef = 2,
+                                     number = nGenes),
+                            keep.rownames = TRUE,
+                            key = "rn")
+    prior.dtb[, itgMth := "nc"]
+    ## post integration
+    post.dtb <- do.call(rbind,
+                        lapply(names(itg.lst), function(itgMth) {
+                            if(marker == "grade") {
+                                post.mtx <- itg.lst[[itgMth]][["a"]][["frma"]][, smpls2kp]
+                            } else {
+                                post.mtx <- itg.lst[[itgMth]][["p2"]][["frma"]][, smpls2kp]
+                            }
+                            fitPost <- lmFit(post.mtx,
+                                             m.mtx)
+                            fitPost <- eBayes(fitPost)
+                            post.dfr <- topTable(fitPost,
+                                                 coef = 2,
+                                                 number = nGenes)
+                            post.dfr[["itgMth"]] <- itgMth
+                            data.table(post.dfr,
+                                       keep.rownames = TRUE,
+                                       key = "rn")
+                        }))
+    ## add fData to post.dfr
+    post.dtb <- a.dtb[post.dtb]
+    setcolorder(prior.dtb, colnames(post.dtb))
+    data.table(rbind(prior.dtb, post.dtb))
+}
+## differential expression analysis datasets
+deaGses <- c("GSE25065",
+             "GSE2034",
+             "GSE17705")
+deaERGses <- c("GSE21653",
+               "GSE5460",
+               "GSE2109")
+## compute list of differentially expressed genes
+dea.dtb <- do.call(rbind,
+                   lapply(deaGses, function(g) {
+                       dtb <- getDiffExprGns(g, nGenes = 1e2)
+                       dtb[, gse := g]
+                       dtb
+                   }))
+deaER.dtb <- do.call(rbind,
+                     lapply(deaERGses, function(g) {
+                         dtb <- getDiffExprGns(g,
+                                               nGenes = 1e2,
+                                               marker = "er")
+                         dtb[, gse := g]
+                         dtb
+}))
+## compare number of differentially expressed genes across different integration
+## procedures
+tab4.dtb <- data.table(GSE = deaGses)
+gradeDeaGses.mtx <- sapply(deaGses, function(g)
+    table(na.omit(eSet.lst[["frma"]][[dsets.dtb[GSE == g, id]]]$grade)))
+tab4.dtb[, ':='(nGrade2 = gradeDeaGses.mtx[2, ],
+                nGrade3 = gradeDeaGses.mtx[3, ]) ]
+setkey(dsets.dtb, "GSE")
+setkey(tab4.dtb, "GSE")
+tab4.dtb <- dsets.dtb[, c("GSE", "fracER+", "fracHER2+"), with = FALSE][tab4.dtb]
+nGenesTab4.dtb <- dea.dtb[,
+                          .(nbGenesDE_BC = length(na.omit(intersect(EntrezGene.ID[itgMth == "nc"], EntrezGene.ID[itgMth == "bc"]))),
+                            nbGenesDE_SABC3 = length(na.omit(intersect(EntrezGene.ID[itgMth == "nc"], EntrezGene.ID[itgMth == "sabc3"]))),
+                            nbGenesDE_SABC5 = length(na.omit(intersect(EntrezGene.ID[itgMth == "nc"], EntrezGene.ID[itgMth == "sabc5"])))),
+                          by = gse]
+setnames(nGenesTab4.dtb, "gse", "GSE")
+setkey(nGenesTab4.dtb, "GSE")
+setkey(tab4.dtb, "GSE")
+tab4.dtb <- tab4.dtb[nGenesTab4.dtb]
+
+tab5.dtb <- data.table(GSE = deaERGses)
+ERDeaGses.mtx <- sapply(deaERGses, function(g)
+    table(na.omit(eSet.lst[["frma"]][[dsets.dtb[GSE == g, id]]]$er)))
+tab5.dtb[, ':='(nERNeg = ERDeaGses.mtx[1, ],
+                nERPos = ERDeaGses.mtx[2, ]) ]
+setkey(dsets.dtb, "GSE")
+setkey(tab5.dtb, "GSE")
+tab5.dtb <- dsets.dtb[, c("GSE", "fracER+", "fracHER2+"), with = FALSE][tab5.dtb]
+nGenesTab5.dtb <- deaER.dtb[,
+                          .(nbGenesDE_BC = length(na.omit(intersect(EntrezGene.ID[itgMth == "nc"], EntrezGene.ID[itgMth == "bc"]))),
+                            nbGenesDE_SABC3 = length(na.omit(intersect(EntrezGene.ID[itgMth == "nc"], EntrezGene.ID[itgMth == "sabc3"]))),
+                            nbGenesDE_SABC5 = length(na.omit(intersect(EntrezGene.ID[itgMth == "nc"], EntrezGene.ID[itgMth == "sabc5"])))),
+                          by = gse]
+setnames(nGenesTab5.dtb, "gse", "GSE")
+setkey(nGenesTab5.dtb, "GSE")
+setkey(tab5.dtb, "GSE")
+tab5.dtb <- tab5.dtb[nGenesTab5.dtb]
+
+```
+
+```{r table-4, results = "as.is", eval = FALSE, cache = FALSE}
+setnames(tab4.dtb,
+         c("nbGenesDE_BC",
+           "nbGenesDE_SABC3",
+           "nbGenesDE_SABC5"),
+         c("nbGenesDE: BC",
+           "nbGenesDE: SABC3",
+           "nbGenesDE: SABC5"))
+kable(tab4.dtb,
+      format = "html",
+      digits = 2,
+      caption = "Table 4---For each dataset, a list of the top 100 genes differentially expressed between grade 2 and grade 3 expression profiles was computed.  Shown is the number of genes in common with lists generated from the same comparison, after BC, SABC3 and SABC5 integration.") %>%
+    kable_styling(bootstrap_options = "striped",
+                  full_width = FALSE)
+setnames(tab5.dtb,
+         c("nbGenesDE_BC",
+           "nbGenesDE_SABC3",
+           "nbGenesDE_SABC5"),
+         c("nbGenesDE: BC",
+           "nbGenesDE: SABC3",
+           "nbGenesDE: SABC5"))
+kable(tab5.dtb,
+      format = "html",
+      digits = 2,
+      caption = "Table 5---For each dataset, a list of the top 100 genes differentially expressed between ER+ and ER-- expression profiles was computed.  Shown is the number of genes in common with lists generated from the same comparison, after BC, SABC3 and SABC5 integration.") %>%
+    kable_styling(bootstrap_options = "striped",
+                  full_width = FALSE)
+```
+
+```{r snagee, eval = FALSE, cache = TRUE}
+snageeWrapper <- function(obj, # object must be either eSet or matrix
+                          chip) {
+    ## retrieve list with two components:
+    ## 1. genes: unique EntrezGene.ID, no NAs. Collapse as needed
+    ## 2. data: matrix of logged gene expression values, rownames correspond to genes
+    if(class(obj) == "ExpressionSet") {
+        eset <- obj
+        ez <- fData(eset)$EntrezGene.ID
+        e.mtx <- exprs(eset)
+    } else {
+        e.mtx <- obj
+        a.dfr <- annot.lst[[chip]]
+        ez <- a.dfr[rownames(e.mtx), "EntrezGene.ID"]
+    }
+    ## retain only non-NA values
+    ez2kp <- !is.na(ez)
+    ez <- ez[ez2kp]
+    e.mtx <- e.mtx[ez2kp, ]
+    ## collapse (using which.max)
+    .sums <- rowSums(abs(e.mtx), na.rm = TRUE)
+    .id <- tapply(1:nrow(e.mtx),
+                  ez,
+                  function(x) x[which.max(.sums[x])])
+    list(genes = ez[.id],
+         data = e.mtx[.id, ])
+}
+
+qualPrior.dtb <- do.call(rbind,
+                         lapply(names(eSet.lst), function(nrmMth) {
+                             do.call(rbind,
+                                     lapply(names(eSet.lst[[nrmMth]]), function(dsetNm) {
+                                         eset <- eSet.lst[[nrmMth]][[dsetNm]]
+                                         chip <- gsub("(.*)-(.*)", "\\2", dsetNm)
+                                         data.table(dset = dsetNm,
+                                                    chip = chip,
+                                                    nrmMth = nrmMth,
+                                                    itgMth = "nc",
+                                                    qualStudy = qualStudy(snageeWrapper(eset,
+                                                                                        chip)))
+                                     }))
+                         }))
+
+qualPost.dtb <- do.call(rbind,
+                        lapply(names(itg.lst), function(itgMth) {
+                            do.call(rbind,
+                                    lapply(names(itg.lst[[itgMth]]), function(chip) {
+                                        do.call(rbind,
+                                                lapply(names(itg.lst[[itgMth]][[chip]]), function(nrmMth) {
+                                                    itg.mtx <- itg.lst[[itgMth]][[chip]][[nrmMth]]
+                                                    do.call(rbind,
+                                                            lapply(levels(fac.lst[[chip]]), function(dsetNm) {
+                                                                smpls2do <- which(fac.lst[[chip]] == dsetNm)
+                                                                data.table(dset = dsetNm,
+                                                                           chip = chip,
+                                                                           nrmMth = nrmMth,
+                                                                           itgMth = itgMth,
+                                                                           qualStudy = qualStudy(snageeWrapper(itg.mtx[, smpls2do], chip)))
+                                                            }))
+                                                }))
+                                        }))
+                            }))
+
+qual.dtb <- rbind(qualPrior.dtb, qualPost.dtb)
+setnames(qual.dtb, "dset", "id")
+setkey(qual.dtb, id)
+setkey(dsets.dtb, id)
+qual.dtb <- dsets.dtb[, .(GSE, id)][qual.dtb]
+qual.dtb[, itgMth := ordered(itgMth,
+                             levels = c("nc", "bc", "sabc3", "sabc5"),
+                             labels = c("Prior to Integration",
+                                        "BC",
+                                        "SABC3",
+                                        "SABC5"))]
+qual.dtb[, nrmMth := ordered(nrmMth,
+                             levels = normMths,
+                             labels = toupper(normMths))]
+
+```
+
+```{r snagee-plot, eval = FALSE, height = 2, width = 8}
+ggplot(qual.dtb,
+       aes(x = itgMth,
+           y = qualStudy)) +
+    geom_point() +
+    facet_grid(nrmMth ~ GSE) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.title.x = element_blank(),
+          axis.text = element_text(size = 8),
+          axis.title.y = element_text(size = 10),
+          strip.text.x = element_text(size = 7),
+          strip.text.y = element_text(size = 10))
+
+```
+
+## 2.3---Comparison with other Methods ##
+
+SABC is not the first method to account for external biological variables or
+clinical covariates during dataset integration. ComBat offers the possibility of
+using clinical variables as covariates during dataset integration.
+[Harman](https://www.ncbi.nlm.nih.gov/pubmed/27585881 "Risk-conscious correction
+of batch effects: maximising information extraction from high-throughput genomic
+datasets"), a more recent integration procedure using a PCA and a constrained
+optimisation technique, also calls for factor coding for an "experimental
+grouping variable" to drive integration.  We ran ComBat and Harman to integrate
+the 1015 breast tumours hybridised onto the the HG-U133Plus2 chip, using the the
+output of the 5-class sorlie2003 SSP as covariate and experimental grouping
+variable respectively.
+
+```{r er-a-boxplots-other, fig.height = 6, fig.width = 9, eval = TRUE, fig.cap = 'Figure X---205225_at probeset measurements hybridised onto the HG-U133a chip broken by dataset prior and post integration.  Integration was done using subtype-aware batch correction (SABC5, driven by a five-subtype SSP), ComBat (BCCOV5, using a five-subtype SSP as covariate) and Harman (HRMN5, using a five-subtype SSP as a grouping variable).  The distributions are further split by ER status, independently assessed by IHC on fresh frozen specimens.  Raw data was normalised with FRMA, RMA and MAS5.'}
+ggplot(bxplt.dtb[chip == "a" &
+                 ihc.marker == "er" &
+                 !is.na(ihc.status) &
+                 itg.method %in% c("nc", "sabc5", "bccov5", "hrmn5") &
+                 ## nrm.method == "frma" &
+                 !is.na(expr)],
+       aes(x = ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE25065",
+                                  "GSE2034",
+                                  "GSE17705")),
+           y = expr,
+           colour = ordered(ihc.status,
+                            levels = 0:1,
+                            labels = c("ER-", "ER+")))) +
+    geom_boxplot() +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    scale_y_continuous(limits = c(2.5, 14)) +
+    scale_colour_manual(name = "IHC ER Status",
+                        values = c("violetred", "steelblue")) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "sabc5",
+                                      "bccov5",
+                                      "hrmn5"),
+                           labels = c("Prior to Integration",
+                                      "SABC5",
+                                      "BCCOV5",
+                                      "HRMN5")),
+               scales = "free") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 14),
+          legend.position = "top",
+          legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16))
+```
+
+```{r er-a-extreme-datasets-by-er-status-other, fig.height = 5, fig.width = 8, eval = TRUE, fig.cap = 'Figure Y---Distributions of probeset 205225_at measurements from datasets GSE5327 (n=58, all ER--) and GSE17705 (n=298, all ER+), taken from **Fig.X**, are compared side by side. See **Fig.X** for details.'}
+ggplot(bxplt.dtb[dataset %in% c("GSE5327",
+                                "GSE17705") &
+                 chip == "a" &
+                 itg.method %in% c("nc", "sabc5", "bccov5", "hrmn5") &
+                 ihc.marker == "er"],
+       aes(x = ordered(dataset,
+                       levels = c("GSE5327",
+                                  "GSE17705"),
+                       labels = c("GSE5327\n0% ER+",
+                                  "GSE17705\n100% ER+")),
+           y = expr)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(5, 18)) +
+    xlab("") +
+    ylab("ESR1 (205225_at)") +
+    geom_signif(comparisons = list(c("GSE5327\n0% ER+",
+                                     "GSE17705\n100% ER+")),
+                y_position = 16,
+                vjust = -.4,
+                test = "t.test",
+                textsize = 3.6,
+                tip_length = 0) +
+    facet_grid(ordered(nrm.method,
+                       levels = c ("frma",
+                                   "rma",
+                                   "mas5"),
+                       labels = c("FRMA",
+                                  "RMA",
+                                  "MAS5")) ~
+                   ordered(itg.method,
+                           levels = c("nc",
+                                      "sabc5",
+                                      "bccov5",
+                                      "hrmn5"),
+                           labels = c("Prior to Integration",
+                                      "SABC5",
+                                      "BCCOV5",
+                                      "HRMN5")),
+               scales = "free") +
+    ## ggtitle("HG-U133a") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45,
+                                     hjust = 1,
+                                     vjust = 1),
+          axis.text = element_text(size = 12),
+          axis.title = element_text(size = 16),
+          strip.text = element_text(size = 12),
+          plot.title = element_text(size = 16))
+## ggsave(file.path(graphsDir, "comparisons-extreme-datasets-a.pdf"),
+##        width = 11,
+##        height = 5)
+```
+
+```{r gPCA, eval = FALSE}
+system.time(gpcaCor.lst <- lapply(c("sabc5", "bccov5", "hrmn5"), function(m) {
+    mtx <- itg.lst[[m]][["a"]][["frma"]][, mcdSmpls.lst[["a"]]]
+    b <- as.numeric(fac.lst[["a"]][mcdSmpls.lst[["a"]]])
+    gPCA.batchdetect(x = t(mtx),
+                     batch = b,
+                     center = FALSE,
+                     nperm = 1e3)
+}))
+gpcaUncor <- gPCA.batchdetect(x = t(cc.lst[["a"]][["frma"]]),
+                       batch = as.numeric(fac.lst[["a"]]),
+                       center = FALSE,
+                       nperm = 1e3)
+
+```
+
+```{r pam50-concordance-plot-other, fig.height = 5, fig.width = 9, fig.cap = 'Figure Z---PAM50 subtype assignments for 1015 samples from six datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  Subtype assignements were computed prior to dataset integration (first row) and post integration with BC, SABC3 and SABC5 (subsequent rows).'}
+## gseLvls <- pam50Mlt.dtb[, levels(gse)]
+## gseLbls <- gseLvls
+## gseLbls[length(gseLbls)] <- sprintf("GSE\n%s", gsub("GSE", "", gseLvls[length(gseLbls)]))
+## pam50Mlt.dtb[, gse := ordered(gse,
+##                               levels = levels(gse),
+##                               labels = gseLbls)]
+ggplot(pam50Mlt.dtb[!itgMth %in% c("BC", "SABC3")],
+       aes(x = sampleName,
+           y = 1,
+           fill = pam50,
+           colour = pam50)) +
+  geom_tile() +
+  scale_fill_manual(values = cols) +
+  scale_colour_manual(values = cols) +
+    facet_grid(itgMth ~ ordered(gse,
+                                levels = levels(gse),
+                                labels = gseLbls),
+               scale = "free",
+               space = "free") +
+  theme_bw() +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
+```
