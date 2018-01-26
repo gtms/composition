@@ -6,7 +6,8 @@ author: |
     | Gil Tomás
     | gil.tomas@igmm.ed.ac.uk
 output:
-    github_document:
+    md_document:
+        variant: markdown_github
         toc: true
         toc_depth: 2
         df_print: paged
@@ -17,7 +18,7 @@ knitr::opts_chunk$set(echo = TRUE,
                       tidy = TRUE,
                       message = FALSE,
                       warning = FALSE,
-                      echo = FALSE,
+                      ## echo = FALSE,
                       cache = FALSE,
                       cache.path = "../cache/composition_",
                       cache.lazy = FALSE,
