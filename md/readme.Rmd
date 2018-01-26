@@ -1039,7 +1039,7 @@ with the same IHC ER+ proportions as the original datasets.  Comparisons of
 subtype assignements prior and post-integration in this experiment can be seen
 in **Fig.6** and **Table 3**.
 
-```{r integrate-proportions, eval = TRUE, cache = TRUE, results = "hide"}
+```{r integrate-proportions, eval = FALSE, cache = TRUE, results = "hide"}
 ppGses <- c("GSE2109", "GSE21653", "GSE5460", "GSE16446", "GSE23177")
 ppIds <- dsets.dtb[GSE %in% ppGses, id]
 ## 116 is the minimum number of samples
@@ -1149,7 +1149,7 @@ ppPam50Mlt.dtb[, itgMth := ordered(itgMth,
                                               "SABC5"))]
 ```
 
-```{r pam50-concordance-proportions-plot, fig.height = 5, fig.width = 9, fig.cap = 'Figure 6---PAM50 subtype assignments for 580 samples from five datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  For each dataset, 116 samples were randomly selected in order to respect the original IHC ER+ fraction.  Subtype assignments were computed prior- (top row) and post- (subsequent rows) dataset integration with BC, SABC3 and SABC5.'}
+```{r pam50-concordance-proportions-plot, fig.height = 5, fig.width = 9, eval = FALSE, fig.cap = 'Figure 6---PAM50 subtype assignments for 580 samples from five datasets (**Table 1**) hybridised on the HG-U133Plus2 chip and normalised with FRMA.  For each dataset, 116 samples were randomly selected in order to respect the original IHC ER+ fraction.  Subtype assignments were computed prior- (top row) and post- (subsequent rows) dataset integration with BC, SABC3 and SABC5.'}
 ggplot(ppPam50Mlt.dtb, aes(x = sampleName,
                            y = 1,
                            fill = pam50,
@@ -1174,7 +1174,7 @@ ggplot(ppPam50Mlt.dtb, aes(x = sampleName,
         strip.text.y = element_text(size = 8))
 ```
 
-```{r p2-kvals-proportions, eval = TRUE, cache = TRUE}
+```{r p2-kvals-proportions, eval = FALSE, cache = TRUE}
 ppK.lst <- list()
 itgMthsRdx <- c("bc", "nc", "sabc3", "sabc5")
 ppK.lst[["all"]] <- sapply(itgMthsRdx, function(itgMth) {
@@ -1210,7 +1210,7 @@ ppK.dtb[GSE == "all", nSamples := ppK.dtb[, sum(nSamples, na.rm = TRUE)]]
 setorder(ppK.dtb, -nSamples)
 ```
 
-```{r table-3, results = "as.is", eval = TRUE}
+```{r table-3, results = "as.is", eval = FALSE}
 kable(ppK.dtb,
       format = "html",
       digits = 2,
